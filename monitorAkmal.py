@@ -40,7 +40,9 @@ FONNTE_TARGETS = ["6281933976553"]
 GEMINI_API_KEY = "AIzaSyBAVnV2udYQWWvPEOyZ2cuAE91WBHcIaKc"
 GEMINI_MODEL = "gemini-2.5-flash"
 
-
+# File untuk log anti-spam
+ALERT_LOG_FILE = "/tmp/alert_log.json"
+COOLDOWN_SECONDS = 600  # 10 menit antar alert per IP
 
 # ==================== LOGGING ====================
 logging.basicConfig(level=logging.INFO,
@@ -83,7 +85,25 @@ def utc_now_iso() -> str:
 def is_admin_ip(ip: str) -> bool:
     return ip in ADMIN_IP_WHITELIST
 
+# ---- Anti Spam ----
+def load_alert_log():
+    if os.path.exists(ALERT_LOG_FILE):
+        with open(ALERT_LOG_FILE, "r") as f:
+            return json.load(f)
+    return {}
 
+def save_alert_log(data):
+    with open(ALERT_LOG_FILE, "w") as f:
+        json.dump(data, f)
+
+def send_fonnte_message(ip: str, message: str):
+    alert_log = load_alert_log()
+    now = time.time()
+
+    # Skip kirim WA jika IP masih dalam masa cooldown
+    if ip in alert_log and now - alert_log[ip] < COOLDOWN_SECONDS:
+        logging.info("[SKIP WA] %s masih dalam cooldown", ip)
+        return
 
     for target in FONNTE_TARGETS:
         try:
