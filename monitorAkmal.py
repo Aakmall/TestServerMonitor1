@@ -27,7 +27,7 @@ HOSTNAME = socket.gethostname()
 ADMIN_IP_WHITELIST = {"36.85.218.181"}
 
 # Log path
-LOG_PATHS = ["/var/log/auth.log", "/var/log/secure"]
+LOG_PATHS = ["/var/log/auth.log", "/var/log/secure", "/var/log/syslog"]
 WEB_LOG_PATHS = ["/var/log/nginx/access.log", "/var/log/apache2/access.log"]
 
 # Deteksi & notifikasi
@@ -48,8 +48,9 @@ ALERT_LOG_FILE = "/tmp/alert_log.json"
 # ==================== REGEX PATTERNS ====================
 
 RE_SUCCESS = re.compile(
-    r"Accepted\s+(password|publickey|keyboard-interactive(?:/pam)?)\s+for\s+(\S+)\s+from\s+(\S+)"
+    r"Accepted\s+(?:password|publickey|keyboard-interactive(?:/pam)?).*for\s+(\S+)\s+from\s+(\S+)"
 )
+
 RE_FAIL = re.compile(r"Failed\s+password\s+for\s+(?:invalid user\s+)?(\S+)\s+from\s+(\S+)")
 RE_WEB_ACCESS = re.compile(r'(?P<ip>\S+) \S+ \S+ \[.*?\] "(?P<req>[^"]+)" (?P<status>\d{3})')
 
