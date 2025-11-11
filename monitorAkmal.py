@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
+# monitorAkmal.py — Enhanced IDS + Auto Blocking + WA Alert (Clean & Anti-Spam)
+
 import os
-import re
+import json
 import time
+import re
 import socket
 import logging
 import requests
@@ -11,31 +14,41 @@ import threading
 import shutil
 from collections import defaultdict, deque
 from datetime import datetime, timezone
-from typing import Iterator
 
-# ---------------- Config ----------------
+# ==================== CONFIG ====================
 HOSTNAME = socket.gethostname()
+
+# Whitelist IP Admin
+ADMIN_IP_WHITELIST = {"36.85.218.181"}
+
+# Log file paths
 LOG_PATHS = ["/var/log/auth.log", "/var/log/secure"]
+WEB_LOG_PATHS = ["/var/log/nginx/access.log", "/var/log/apache2/access.log"]
+
+# Interval konfigurasi
 POLL_INTERVAL = 1.0
 FAIL_WINDOW_SEC = 300
-SUCCESS_WINDOW_SEC = 300
+SHORT_WINDOW_SEC = 60
+AGGREGATE_INTERVAL = 60
+DEDUP_TTL_SEC = 60
 FAIL_THRESHOLD = 5
-SUCCESS_THRESHOLD = 2
-ALERT_SESSION_OPEN = False  # False supaya session open tidak mengganggu
+SPAM_THRESHOLD_PER_MIN = 6
 
-# Fonnte API (gantikan dengan token dan nomor WA milikmu)
-FONNTE_TOKEN = " uqMuVhM4YKzujVg38BiB"
+# Token konfigurasi
+FONNTE_TOKEN = "iUrpA4Y6qP7AdcNHewBs"
 FONNTE_TARGETS = ["6281933976553"]
-
-# Gemini API Key & model (gantikan dengan milikmu)
-GEMINI_API_KEY = "AIzaSyA6cfTruhVM6xwpRRX_03ZQXyIQCTd4JVE"
+GEMINI_API_KEY = "AIzaSyBAVnV2udYQWWvPEOyZ2cuAE91WBHcIaKc"
 GEMINI_MODEL = "gemini-2.5-flash"
 
-# Logging
+# File untuk log anti-spam
+ALERT_LOG_FILE = "/tmp/alert_log.json"
+COOLDOWN_SECONDS = 600  # 10 menit antar alert per IP
+
+# ==================== LOGGING ====================
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 
-# Regex
+# ==================== REGEX ====================
 RE_SUCCESS = re.compile(
     r"Accepted\s+(?P<method>password|publickey|keyboard-interactive(?:/pam)?)\s+for\s+(?P<user>\S+)\s+from\s+(?P<ip>\S+)",
     re.IGNORECASE,
@@ -44,40 +57,54 @@ RE_FAIL = re.compile(
     r"Failed\s+password\s+for\s+(?:invalid user\s+)?(?P<user>\S+)\s+from\s+(?P<ip>\S+)",
     re.IGNORECASE,
 )
-RE_SESSION_OPEN = re.compile(
-    r"session opened for user\s+(?P<user>[A-Za-z0-9_.@-]+)",
-    re.IGNORECASE,
+RE_WEB_COMBINED = re.compile(
+    r'(?P<ip>\S+) \S+ \S+ \[(?P<time>[^\]]+)\] "(?P<req>[^"]+)" (?P<status>\d{3}) (?P<size>\S+) "(?P<ref>[^"]*)" "(?P<ua>[^"]*)"'
 )
 
-# ---------- Functions ----------
+SQLI_PATTERNS = [
+    re.compile(r"(?i)(union(\s+all)?\s+select)"),
+    re.compile(r"(?i)(or\s+1=1)"),
+    re.compile(r"(?i)(' or '1'='1)"),
+    re.compile(r"(?i)(sleep\()\b"),
+    re.compile(r"(?i)(information_schema)"),
+    re.compile(r"(?i)(benchmark\()"),
+    re.compile(r"(?i)(--\s*$)"),
+]
+XSS_PATTERNS = [
+    re.compile(r"(?i)<script[^>]*>"),
+    re.compile(r"(?i)onerror\s*="),
+    re.compile(r"(?i)javascript:"),
+    re.compile(r"(?i)<img[^>]+src"),
+]
+CSRF_INDICATORS = [re.compile(r"(?i)csrf_token")]
+
+# ==================== HELPER ====================
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def is_admin_ip(ip: str) -> bool:
+    return ip in ADMIN_IP_WHITELIST
 
-def analyze_with_gemini(summary: str) -> str | None:
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        prompt = (
-            "Nama kamu BotAkmal. Berikan analisis singkat dan padat untuk peristiwa berikut. "
-            "Jawab dalam bahasa Indonesia TANPA pendahuluan apapun dengan format tepat dua bagian berikut:\n\n"
-            "*Tingkat Risiko:* <Low|Medium|High>\n\n"
-            "*Alasan:* <alasan ringkas, 1-3 kalimat>\n\n"
-            f"Peristiwa: {summary}"
-        )
-        resp = model.generate_content(prompt)
-        text = (getattr(resp, 'text', '') or '').strip()
-        return text if text else None
-    except Exception as e:
-        logging.warning("Gemini gagal: %s", e)
-        return None
+# ---- Anti Spam ----
+def load_alert_log():
+    if os.path.exists(ALERT_LOG_FILE):
+        with open(ALERT_LOG_FILE, "r") as f:
+            return json.load(f)
+    return {}
 
+def save_alert_log(data):
+    with open(ALERT_LOG_FILE, "w") as f:
+        json.dump(data, f)
 
-def send_fonnte_message(message: str):
-    if not FONNTE_TOKEN or not FONNTE_TARGETS:
-        logging.warning("Fonnte tidak dikonfigurasi; lewati kirim WhatsApp.")
+def send_fonnte_message(ip: str, message: str):
+    alert_log = load_alert_log()
+    now = time.time()
+
+    # Skip kirim WA jika IP masih dalam masa cooldown
+    if ip in alert_log and now - alert_log[ip] < COOLDOWN_SECONDS:
+        logging.info("[SKIP WA] %s masih dalam cooldown", ip)
         return
+
     for target in FONNTE_TARGETS:
         try:
             r = requests.post(
@@ -86,222 +113,241 @@ def send_fonnte_message(message: str):
                 data={"target": target, "message": message},
                 timeout=10,
             )
-            logging.info("Fonnte ke %s: %s", target, r.status_code)
+            if r.status_code == 200:
+                alert_log[ip] = now
+                save_alert_log(alert_log)
+                logging.info("[WA SENT] ke %s untuk %s", target, ip)
+            else:
+                logging.warning("[WA ERROR] %s: %s", target, r.text)
         except Exception as e:
-            logging.warning("Fonnte error ke %s: %s", target, e)
+            logging.warning("Fonnte error: %s", e)
 
+def analyze_with_gemini(summary: str, timeout_sec: float = 6.0) -> str | None:
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        prompt = (
+            "Nama kamu Akmal. Analisis singkat & padat peristiwa berikut.\n"
+            "Gunakan format:\n"
+            "Tingkat Risiko: <Low|Medium|High>\n"
+            "Alasan: <1 kalimat>\n\n"
+            f"Peristiwa: {summary}"
+        )
+        resp = model.generate_content(prompt)
+        return (getattr(resp, "text", "") or "").strip() or None
+    except Exception:
+        return None
 
-def gemini_insight_with_timeout(summary: str, timeout_sec: float = 6.0) -> str | None:
-    def _call():
-        return analyze_with_gemini(summary)
+def gemini_insight(summary: str) -> str:
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(_call)
-            return fut.result(timeout=timeout_sec)
-    except concurrent.futures.TimeoutError:
-        logging.warning("Gemini timeout setelah %.1fs", timeout_sec)
-        return None
+            fut = ex.submit(analyze_with_gemini, summary)
+            return fut.result(timeout=6)
+    except Exception:
+        return "Tidak ada analisis AI."
+
+def format_whatsapp_message(summary: str, labels: list | None = None, analysis: str | None = None) -> str:
+    """Format pesan WA yang rapi dan mudah dibaca"""
+    msg = [
+        f"📡 *Server:* {HOSTNAME}",
+        f"🕒 *Waktu:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        f"🧾 *Peristiwa:* {summary}",
+    ]
+    if labels:
+        msg.append(f"🚨 *Deteksi:* {', '.join(labels)}")
+    msg.append("")
+    msg.append(f"🤖 *Rekomendasi:* {analysis or '-'}")
+    return "\n".join(msg)
+
+# ==================== FIREWALL BLOCK ====================
+# --- temporary block 10 minutes ---
+BLOCK_DURATION = 600  # 10 menit
+
+_blocked_ips = set()
+_blocked_ips_lock = threading.Lock()
+
+def _remove_firewall_rule(ip: str):
+    try:
+        if shutil.which("ufw"):
+            subprocess.run(["ufw", "delete", "deny", "from", ip], check=False)
+            logging.warning("Unblocked %s via ufw (temporary)", ip); return True
+        if shutil.which("nft"):
+            subprocess.run(["nft", "delete", "rule", "inet", "filter", "input",
+                            "ip", "saddr", ip, "drop"], check=False)
+            logging.warning("Unblocked %s via nft (temporary)"); return True
+        if shutil.which("iptables"):
+            subprocess.run(["iptables", "-D", "INPUT", "-s", ip, "-j", "DROP"], check=False)
+            logging.warning("Unblocked %s via iptables (temporary)"); return True
     except Exception as e:
-        logging.warning("Gemini error: %s", e)
-        return None
+        logging.warning("Unblock failed for %s: %s", ip, e)
+    return False
+
+def _schedule_unblock(ip: str, delay: int = BLOCK_DURATION):
+    def _worker():
+        try:
+            logging.info("Will unblock %s after %s seconds", ip, delay)
+            time.sleep(delay)
+            _remove_firewall_rule(ip)
+        finally:
+            with _blocked_ips_lock:
+                _blocked_ips.discard(ip)
+            try:
+                msg = format_whatsapp_message(
+                    f"IP {ip} otomatis dibuka setelah {delay//60} menit.",
+                    labels=["Unblock"], analysis=None
+                )
+                send_fonnte_message("system", msg)
+            except Exception as e:
+                logging.warning("Failed to notify unblock for %s: %s", ip, e)
+    threading.Thread(target=_worker, daemon=True).start()
+
+def block_ip(ip: str) -> bool:
+    with _blocked_ips_lock:
+        if ip in _blocked_ips:
+            logging.info("IP %s already temporarily blocked", ip)
+            return True
+        _blocked_ips.add(ip)
+    try:
+        if shutil.which("ufw"):
+            subprocess.run(["ufw", "deny", "from", ip], check=False)
+            logging.warning("Temporarily blocked %s via ufw", ip)
+        elif shutil.which("nft"):
+            subprocess.run(["nft", "add", "rule", "inet", "filter", "input",
+                            "ip", "saddr", ip, "drop"], check=False)
+            logging.warning("Temporarily blocked %s via nft", ip)
+        elif shutil.which("iptables"):
+            subprocess.run(["iptables", "-I", "INPUT", "1", "-s", ip, "-j", "DROP"], check=False)
+            logging.warning("Temporarily blocked %s via iptables", ip)
+        else:
+            logging.warning("No firewall tool found; in-memory block only for %s", ip)
+
+        msg = format_whatsapp_message(
+            f"IP {ip} sementara diblokir {BLOCK_DURATION//60} menit karena deteksi ancaman.",
+            labels=["Temporary Block"], analysis=None
+        )
+        send_fonnte_message(ip, msg)
+
+        _schedule_unblock(ip, delay=BLOCK_DURATION)
+        return True
+    except Exception as e:
+        logging.warning("Block failed: %s", e)
+        with _blocked_ips_lock:
+            _blocked_ips.discard(ip)
+        return False
 
 
-def send_with_gemini(message: str, summary: str | None = None):
-    insight = gemini_insight_with_timeout(summary or message)
-    block = f"\n\nAnalisis BotAkmal (Gemini):\n{insight.strip()}" if (insight and insight.strip()) else "\n\nAnalisis BotAkmal (Gemini): -"
-    send_fonnte_message(message + block)
 
-
+# ==================== EVENT PARSING ====================
 def parse_event(line: str):
     now = utc_now_iso()
-    m = RE_SUCCESS.search(line)
+    for regex, etype in [(RE_SUCCESS, "login_success"), (RE_FAIL, "login_fail")]:
+        m = regex.search(line)
+        if m:
+            return {"ts": now, "type": etype, "ip": m.group("ip"), "user": m.groupdict().get("user", "?"), "raw": line}
+    m = RE_WEB_COMBINED.search(line)
     if m:
-        return {"ts": now, "type": "login_success", "user": m.group("user"), "ip": m.group("ip"),
-                "method": m.group("method"), "raw": line.strip()}
-    m = RE_FAIL.search(line)
-    if m:
-        return {"ts": now, "type": "login_fail", "user": m.group("user"), "ip": m.group("ip"), "raw": line.strip()}
-    m = RE_SESSION_OPEN.search(line)
-    if m and ALERT_SESSION_OPEN:
-        return {"ts": now, "type": "session_open", "user": m.group("user"), "raw": line.strip()}
+        return {
+            "ts": now,
+            "type": "web_access",
+            "ip": m.group("ip"),
+            "status": int(m.group("status")),
+            "req": m.group("req"),
+        }
     return None
 
+# ==================== DETECTION ====================
+def detect_patterns(text: str) -> list:
+    found = []
+    for p in SQLI_PATTERNS:
+        if p.search(text): found.append("SQLi")
+    for p in XSS_PATTERNS:
+        if p.search(text): found.append("XSS")
+    for p in CSRF_INDICATORS:
+        if p.search(text): found.append("CSRF?")
+    return found
 
-def tail_file(path: str):
-    pos = None
-    initialized = False
-    while True:
-        try:
-            with open(path, "r", errors="ignore") as f:
-                if not initialized:
-                    f.seek(0, os.SEEK_END)
-                    pos = f.tell()
-                    initialized = True
-                else:
-                    f.seek(pos)
-                chunk = f.read()
-                if chunk:
-                    pos = f.tell()
-                    for line in chunk.splitlines():
-                        yield line
-                else:
-                    size = os.path.getsize(path)
-                    if size < pos:
-                        pos = 0
-        except FileNotFoundError:
-            pass
-        time.sleep(POLL_INTERVAL)
-        yield None
-
-
-def iter_journald_sshd() -> Iterator[str | None]:
-    try:
-        proc = subprocess.Popen(
-            [
-                "journalctl",
-                "-f",
-                "-n", "0",
-                "-o", "cat",
-                "-u", "ssh",
-                "-u", "sshd",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-    except Exception:
-        proc = None
-
-    buffer = ""
-    last_yield = time.time()
-    while True:
-        if proc and proc.stdout:
-            line = proc.stdout.readline()
-            if line:
-                yield line.rstrip("\n")
-                last_yield = time.time()
-            else:
-                if time.time() - last_yield >= POLL_INTERVAL:
-                    last_yield = time.time()
-                    yield None
-                time.sleep(0.1)
-        else:
-            time.sleep(POLL_INTERVAL)
-            yield None
-
-
-def format_whatsapp_message_v2(event: dict, analysis_text: str | None = None) -> str:
-    lines = [
-        f"[Login Monitor] Host: {HOSTNAME}",
-        f"Time: {event.get('ts', '-')}",
-        f"Type: {event.get('type', '-')}",
-        f"User: {event.get('user', '-')}",
-    ]
-    if 'ip' in event:
-        lines.append(f"IP: {event.get('ip')}")
-    if 'method' in event:
-        lines.append(f"Method: {event.get('method')}")
-
-    lines.append("")
-    lines.append("Analisis:")
-    if analysis_text and analysis_text.strip():
-        lines.append(analysis_text.strip())
-    else:
-        lines.append("*Tingkat Risiko:* -\n\n*Alasan:* -")
-
-    return "\n".join(lines)
-
-
+# ==================== MAIN ====================
 def main():
-    logging.info("Mulai monitor log SSH...")
-    ip_fail: dict[str, deque[float]] = defaultdict(deque)
-    blocked_ips: set[str] = set()
-    last_sent: dict[tuple, float] = {}
-    DEDUP_TTL_SEC = 60.0
+    logging.info("Memulai pemantauan log...")
 
-    existing_paths = [p for p in LOG_PATHS if os.path.exists(p)]
-    tails = []
-    if existing_paths:
-        tails.extend([(p, tail_file(p)) for p in existing_paths])
-        for p in existing_paths:
-            logging.info("Membaca log file: %s", p)
-    else:
-        logging.warning("Tidak menemukan file log di %s; memakai journald ssh/sshd",
-                        ", ".join(LOG_PATHS))
-        tails.append(("journald:ssh", iter_journald_sshd()))
-        logging.info("Membaca log via journald unit ssh/sshd")
+    ip_last_alert = defaultdict(float)
+    ip_fail = defaultdict(deque)
+    web_status = defaultdict(lambda: defaultdict(int))
+    web_reqs = defaultdict(list)
+    ip_events = defaultdict(list)
+    recent_conn = defaultdict(deque)
+    global_last_agg = 0.0
+
+    # Gabung log
+    paths = [p for p in LOG_PATHS + WEB_LOG_PATHS if os.path.exists(p)]
+    if not paths:
+        logging.warning("Tidak ada log file ditemukan!")
+        return
+
+    files = {p: open(p, "r", errors="ignore") for p in paths}
+    for f in files.values(): f.seek(0, os.SEEK_END)
 
     while True:
-        for path, gen in tails:
-            try:
-                line = next(gen)
-            except Exception:
-                continue
-            if line is None:
+        now = time.time()
+        for p, f in files.items():
+            line = f.readline()
+            if not line:
+                time.sleep(0.1)
                 continue
 
             evt = parse_event(line)
-            if not evt:
+            if not evt: continue
+            ip = evt["ip"]
+
+            # Whitelist admin skip
+            if is_admin_ip(ip):
                 continue
 
-            now_ts = time.time()
-            cutoff_fail = now_ts - FAIL_WINDOW_SEC
-
+            # === SSH LOGIN FAIL ===
             if evt["type"] == "login_fail":
-                dq = ip_fail[evt["ip"]]
-                dq.append(now_ts)
-                while dq and dq[0] < cutoff_fail:
+                dq = ip_fail[ip]
+                dq.append(now)
+                while dq and dq[0] < now - FAIL_WINDOW_SEC:
                     dq.popleft()
 
-                key_fail = ("login_fail_single", evt.get("user"), evt.get("ip"))
-                if last_sent.get(key_fail, 0) + DEDUP_TTL_SEC <= now_ts:
-                    summ_single = f"login_fail user={evt.get('user')} ip={evt.get('ip','-')} host={HOSTNAME}"
-                    analysis_single = gemini_insight_with_timeout(summ_single)
-                    msg_single = format_whatsapp_message_v2(evt, analysis_single)
-                    send_fonnte_message(msg_single)
-                    last_sent[key_fail] = now_ts
+                if len(dq) >= FAIL_THRESHOLD:
+                    blocked = block_ip(ip)
+                    summary = f"{len(dq)} gagal login SSH dari {ip}"
+                    msg = format_whatsapp_message(summary, ["BruteForce"], gemini_insight(summary))
+                    send_fonnte_message(ip, msg)
+                    ip_last_alert[ip] = now
 
-                if len(dq) >= FAIL_THRESHOLD and evt["ip"] not in blocked_ips:
-                    summ = f"{len(dq)} kali gagal login dari {evt['ip']} dalam {FAIL_WINDOW_SEC}s"
-                    analysis = gemini_insight_with_timeout(summ)
-                    msg = format_whatsapp_message_v2(evt, analysis)
-                    send_fonnte_message(msg)
-                    blocked_ips.add(evt["ip"])
-                    logging.warning("Blokir IP %s", evt["ip"])
+            # === SSH LOGIN SUCCESS ===
+            elif evt["type"] == "login_success":
+                if not is_admin_ip(ip):
+                    summary = f"Login SSH berhasil untuk user {evt.get('user','?')} dari {ip}"
+                    msg = format_whatsapp_message(summary, ["Login Success"], "Pastikan ini aktivitas Anda.")
+                    send_fonnte_message(ip, msg)
 
-            if evt["type"] == "login_success":
-                key = (evt["type"], evt.get("user"), evt.get("ip"))
-                if last_sent.get(key, 0) + DEDUP_TTL_SEC <= now_ts:
-                    summ = f"{evt['type']} user={evt.get('user')} ip={evt.get('ip','-')} host={HOSTNAME}"
-                    analysis = gemini_insight_with_timeout(summ)
-                    msg = format_whatsapp_message_v2(evt, analysis)
-                    send_fonnte_message(msg)
-                    last_sent[key] = now_ts
+            # === WEB ACCESS ===
+            elif evt["type"] == "web_access":
+                req = evt["req"]
+                status = evt["status"]
+                patterns = detect_patterns(req)
+                if patterns or status >= 400:
+                    summary = f"Permintaan mencurigakan dari {ip} [{req}] (status {status})"
+                    msg = format_whatsapp_message(summary, patterns, gemini_insight(summary))
+                    send_fonnte_message(ip, msg)
 
-            if ALERT_SESSION_OPEN and evt["type"] == "session_open":
-                key = (evt["type"], evt.get("user"))
-                if last_sent.get(key, 0) + DEDUP_TTL_SEC <= now_ts:
-                    summ = f"{evt['type']} user={evt.get('user')} host={HOSTNAME}"
-                    analysis = gemini_insight_with_timeout(summ)
-                    msg = format_whatsapp_message_v2(evt, analysis)
-                    send_fonnte_message(msg)
-                    last_sent[key] = now_ts
+        time.sleep(0.3)
 
-
+# ==================== STARTUP ====================
 if __name__ == "__main__":
-    logging.info("[BotAkmal] monitor start di %s", HOSTNAME)
+    logging.info("[Akmal] Starting on host %s", HOSTNAME)
 
-    def _notify_startup():
+    def _startup():
         try:
-            sources = [p for p in LOG_PATHS if os.path.exists(p)]
-            source_msg = f"files={', '.join(sources)}" if sources else "journald:ssh,sshd"
-            send_with_gemini(
-                f"[BotAkmal] monitor start di {HOSTNAME}. Sumber log: {source_msg}",
-                summary=f"monitor startup host={HOSTNAME} sources={source_msg}"
-            )
+            msg = f"🟢 [Akmal] aktif di {HOSTNAME}.\nPemantauan log dimulai ✅"
+            send_fonnte_message("system", msg)
         except Exception as e:
-            logging.warning("Startup notify gagal: %s", e)
+            logging.warning("Startup WA gagal: %s", e)
 
-    threading.Thread(target=_notify_startup, daemon=True).start()
+    threading.Thread(target=_startup, daemon=True).start()
     main()
