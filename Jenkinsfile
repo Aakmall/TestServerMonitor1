@@ -51,7 +51,7 @@ python3 - << 'PY'
 import os, socket, datetime, requests
 HOSTNAME = socket.gethostname()
 ts = datetime.datetime.now().isoformat()
-msg = f"[BotAkmal] Jenkins build monitorAkmal.py dimulai di {HOSTNAME} @ {ts}."
+msg = f"[Hallo Akmal] Jenkins build monitorAkmal.py dimulai di {HOSTNAME} @ {ts}."
 
 # Tes integrasi Gemini
 gemini_ok = False
@@ -59,7 +59,7 @@ try:
     import google.generativeai as genai
     genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
     model = genai.GenerativeModel(os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'))
-    resp = model.generate_content("buatkan 2 kata kalau sekarang sudah gemini yang membalas.")
+    resp = model.generate_content("buatkan kata sambutan kalau sekarang sudah gemini yang membalas.")
     if getattr(resp, 'text', ''):
         gemini_ok = True
         msg += "\\nInsight Gemini: " + getattr(resp, 'text', '').strip()
