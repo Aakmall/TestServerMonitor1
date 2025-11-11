@@ -11,7 +11,7 @@ pipeline {
 
     environment {
         SCRIPT_FILE = "monitorAkmal.py"
-        FONNTE_TOKEN = "R3JmjUG5sAmGbSEE7gcG"
+        FONNTE_TOKEN = "uqMuVhM4YKzujVg38BiB"
         FONNTE_TARGETS = "6281933976553"
         GEMINI_API_KEY = "AIzaSyBEs_tXMSn30of1PvGnwn5mwrvogzOk_fo"
         GEMINI_MODEL = "gemini-2.5-flash"

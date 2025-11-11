@@ -35,7 +35,7 @@ FAIL_THRESHOLD = 5            # auto-block after this many failed logins in FAIL
 SPAM_THRESHOLD_PER_MIN = 6    # if > this many single-event alerts/min then aggregate
 
 # Fonnte / Gemini (existing tokens kept)
-FONNTE_TOKEN = "R3JmjUG5sAmGbSEE7gcG"
+FONNTE_TOKEN = "uqMuVhM4YKzujVg38BiB"
 FONNTE_TARGETS = ["6281933976553"]
 GEMINI_API_KEY = "AIzaSyBEs_tXMSn30of1PvGnwn5mwrvogzOk_fo"
 GEMINI_MODEL = "gemini-2.5-flash"
