@@ -59,7 +59,7 @@ try:
     import google.generativeai as genai
     genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
     model = genai.GenerativeModel(os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'))
-    resp = model.generate_content("buatkan kata sambutan kalau sekarang sudah gemini yang membalas.")
+    resp = model.generate_content("buatkan 2 kata sambutan kalau sekarang sudah gemini yang membalas.")
     if getattr(resp, 'text', ''):
         gemini_ok = True
         msg += "\\nInsight Gemini: " + getattr(resp, 'text', '').strip()
