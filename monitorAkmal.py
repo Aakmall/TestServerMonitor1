@@ -1,367 +1,307 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# =====================================================
-# monitorAkmal_fixed.py
-# Server Intrusion Detection + Auto Blocking + WA Alerts
-# (Gemini analysis integrated and guaranteed to appear in WA)
-# =====================================================
-
 import os
 import re
 import time
-import json
-import shutil
 import socket
 import logging
 import requests
-import threading
-import subprocess
 import concurrent.futures
+import subprocess
+import threading
+import shutil
 from collections import defaultdict, deque
 from datetime import datetime, timezone
+from typing import Iterator
 
-# ==================== CONFIGURATION ====================
+# ---------------- Config ----------------
 HOSTNAME = socket.gethostname()
-
-# Admin whitelist (tidak diblok / tidak dikirimi WA)
-ADMIN_IP_WHITELIST = {"36.85.218.181"}
-
-# Log path (sesuaikan dengan servermu)
-LOG_PATHS = ["/var/log/auth.log", "/var/log/secure", "/var/log/syslog"]
-WEB_LOG_PATHS = ["/var/log/nginx/access.log", "/var/log/apache2/access.log"]
-
-# Deteksi & notifikasi
-FAIL_THRESHOLD = 5
-FAIL_WINDOW_SEC = 300
+LOG_PATHS = ["/var/log/auth.log", "/var/log/secure"]
 POLL_INTERVAL = 1.0
-COOLDOWN_SECONDS = 600  # 10 menit cooldown per IP
+FAIL_WINDOW_SEC = 300
+SUCCESS_WINDOW_SEC = 300
+FAIL_THRESHOLD = 5
+SUCCESS_THRESHOLD = 2
+ALERT_SESSION_OPEN = False  # False supaya session open tidak mengganggu
 
-# Token & API Keys (gantikan / pindahkan ke env var jika perlu)
-FONNTE_TOKEN = "uqMuVhM4YKzujVg38BiB"
+# Fonnte API (gantikan dengan token dan nomor WA milikmu)
+FONNTE_TOKEN = " uqMuVhM4YKzujVg38BiB"
 FONNTE_TARGETS = ["6281933976553"]
+
+# Gemini API Key & model (gantikan dengan milikmu)
 GEMINI_API_KEY = "AIzaSyA6cfTruhVM6xwpRRX_03ZQXyIQCTd4JVE"
 GEMINI_MODEL = "gemini-2.5-flash"
 
-# File penyimpanan cooldown
-ALERT_LOG_FILE = "/tmp/alert_log.json"
+# Logging
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
 
-# ==================== REGEX PATTERNS ====================
+# Regex
 RE_SUCCESS = re.compile(
-    r"Accepted\s+(?:password|publickey|keyboard-interactive(?:/pam)?).*for\s+(\S+)\s+from\s+(\S+)"
+    r"Accepted\s+(?P<method>password|publickey|keyboard-interactive(?:/pam)?)\s+for\s+(?P<user>\S+)\s+from\s+(?P<ip>\S+)",
+    re.IGNORECASE,
+)
+RE_FAIL = re.compile(
+    r"Failed\s+password\s+for\s+(?:invalid user\s+)?(?P<user>\S+)\s+from\s+(?P<ip>\S+)",
+    re.IGNORECASE,
+)
+RE_SESSION_OPEN = re.compile(
+    r"session opened for user\s+(?P<user>[A-Za-z0-9_.@-]+)",
+    re.IGNORECASE,
 )
 
-RE_FAIL = re.compile(r"Failed\s+password\s+for\s+(?:invalid user\s+)?(\S+)\s+from\s+(\S+)")
-RE_WEB_ACCESS = re.compile(r'(?P<ip>\S+) \S+ \S+ \[.*?\] "(?P<req>[^"]+)" (?P<status>\d{3})')
-
-SQLI_PATTERNS = [
-    r"(?i)(union(\s+all)?\s+select)",
-    r"(?i)(or\s+1=1)",
-    r"(?i)(' or '1'='1)",
-    r"(?i)(sleep\()",
-    r"(?i)(information_schema)",
-]
-XSS_PATTERNS = [r"(?i)<script", r"(?i)onerror=", r"(?i)javascript:"]
-
-# ==================== LOGGING ====================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-
-
-# ==================== HELPERS ====================
-def utc_now():
+# ---------- Functions ----------
+def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def load_alert_log():
-    try:
-        if os.path.exists(ALERT_LOG_FILE):
-            with open(ALERT_LOG_FILE, "r") as f:
-                return json.load(f)
-    except Exception as e:
-        logging.warning("Gagal membaca alert log: %s", e)
-    return {}
-
-
-def save_alert_log(data):
-    try:
-        with open(ALERT_LOG_FILE, "w") as f:
-            json.dump(data, f)
-    except Exception as e:
-        logging.warning("Gagal menyimpan alert log: %s", e)
-
-
-def is_admin_ip(ip):
-    return ip in ADMIN_IP_WHITELIST
-
-
-# ==================== FONNTE NOTIFICATION ====================
-def send_fonnte_message(ip_key, message):
-    """
-    Kirim WA via Fonnte (dengan cooldown per-IP).
-    ip_key: string key untuk cooldown (mis: 'system' atau IP)
-    message: teks pesan (string)
-    """
-    alert_log = load_alert_log()
-    now = time.time()
-
-    # Cooldown check
-    if ip_key in alert_log and now - alert_log[ip_key] < COOLDOWN_SECONDS:
-        logging.info(f"[SKIP WA] {ip_key} masih dalam cooldown ({int(now - alert_log[ip_key])}s).")
-        return
-
-    headers = {"Authorization": FONNTE_TOKEN}
-    for target in FONNTE_TARGETS:
-        data = {"target": target, "message": message}
-        try:
-            resp = requests.post("https://api.fonnte.com/send", headers=headers, data=data, timeout=10)
-            if resp.status_code == 200:
-                alert_log[ip_key] = now
-                save_alert_log(alert_log)
-                logging.info(f"[WA SENT] {target} -> key={ip_key}")
-            else:
-                logging.warning(f"[WA ERROR] status={resp.status_code} text={resp.text}")
-        except Exception as e:
-            logging.warning(f"[Fonnte Error] {e}")
-
-
-# ==================== GEMINI ANALYSIS (PERBAIKAN) ====================
-def analyze_with_gemini(summary):
-    """
-    Memanggil Google Gemini (jika tersedia).
-    Meng-handle beberapa struktur respons SDK yang mungkin berbeda antara versi.
-    """
+def analyze_with_gemini(summary: str) -> str | None:
     try:
         import google.generativeai as genai
-
         genai.configure(api_key=GEMINI_API_KEY)
-        # beberapa SDK/versi memakai model invocation berbeda; gunakan generate_content jika ada
         model = genai.GenerativeModel(GEMINI_MODEL)
         prompt = (
-            "Analisis singkat tingkat risiko kejadian keamanan berikut:\n"
-            "Gunakan format:\n"
-            "Tingkat Risiko: <Low|Medium|High>\n"
-            "Alasan: <2 kalimat>\n\n"
-            f"Kejadian: {summary}"
+            "Nama kamu BotAkmal. Berikan analisis singkat dan padat untuk peristiwa berikut. "
+            "Jawab dalam bahasa Indonesia TANPA pendahuluan apapun dengan format tepat dua bagian berikut:\n\n"
+            "*Tingkat Risiko:* <Low|Medium|High>\n\n"
+            "*Alasan:* <alasan ringkas, 1-3 kalimat>\n\n"
+            f"Peristiwa: {summary}"
         )
-
-        # coba panggil generate_content (versi SDK yang sering dipakai)
-        response = model.generate_content(prompt)
-
-        # 1) beberapa SDK punya field 'text'
-        if hasattr(response, "text") and response.text:
-            return response.text.strip()
-
-        # 2) beberapa SDK mengemas di candidates[0].content.parts[0].text
-        if hasattr(response, "candidates") and response.candidates:
-            try:
-                cand = response.candidates[0]
-                if hasattr(cand, "content") and getattr(cand.content, "parts", None):
-                    part0 = cand.content.parts[0]
-                    if hasattr(part0, "text"):
-                        return part0.text.strip()
-            except Exception:
-                pass
-
-        # 3) fallback: coba str(response)
-        text_fallback = str(response)
-        if text_fallback and len(text_fallback) < 2000:
-            return text_fallback.strip()
-
-        return "AI Gemini tidak memberikan respons yang bisa dibaca."
+        resp = model.generate_content(prompt)
+        text = (getattr(resp, 'text', '') or '').strip()
+        return text if text else None
     except Exception as e:
-        err = str(e)
-        logging.debug("Gemini exception: %s", err)
-        if "429" in err or "quota" in err.lower():
-            return "⚠️ AI Gemini: Kuota harian habis, analisis otomatis dinonaktifkan sementara."
-        return f"AI Gemini error: {err}"
+        logging.warning("Gemini gagal: %s", e)
+        return None
 
 
-def gemini_insight(summary):
-    """Jalankan analisis AI dalam thread terpisah dengan timeout agar tidak menggantung."""
+def send_fonnte_message(message: str):
+    if not FONNTE_TOKEN or not FONNTE_TARGETS:
+        logging.warning("Fonnte tidak dikonfigurasi; lewati kirim WhatsApp.")
+        return
+    for target in FONNTE_TARGETS:
+        try:
+            r = requests.post(
+                "https://api.fonnte.com/send",
+                headers={"Authorization": FONNTE_TOKEN},
+                data={"target": target, "message": message},
+                timeout=10,
+            )
+            logging.info("Fonnte ke %s: %s", target, r.status_code)
+        except Exception as e:
+            logging.warning("Fonnte error ke %s: %s", target, e)
+
+
+def gemini_insight_with_timeout(summary: str, timeout_sec: float = 6.0) -> str | None:
+    def _call():
+        return analyze_with_gemini(summary)
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(analyze_with_gemini, summary)
-            return fut.result(timeout=12)  # beri waktu lebih lama (12 detik)
+            fut = ex.submit(_call)
+            return fut.result(timeout=timeout_sec)
     except concurrent.futures.TimeoutError:
-        return "AI Gemini timeout, analisis tidak selesai tepat waktu."
+        logging.warning("Gemini timeout setelah %.1fs", timeout_sec)
+        return None
     except Exception as e:
-        return f"AI Gemini gagal: {e}"
+        logging.warning("Gemini error: %s", e)
+        return None
 
 
-# ==================== FORMAT PESAN WA ====================
-def format_whatsapp_message(summary, detection=None, analysis=None):
-    det_text = ", ".join(detection) if detection else "-"
-    analysis_text = analysis or "-"
-    return f"""
-📡 SERVER  : {HOSTNAME}
-🕒 WAKTU   : {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-
-📋 PERISTIWA :
-{summary}
-
-🚨 DETEKSI  : {det_text}
-
-🤖 ANALISIS :
-{analysis_text}
-""".strip()
+def send_with_gemini(message: str, summary: str | None = None):
+    insight = gemini_insight_with_timeout(summary or message)
+    block = f"\n\nAnalisis BotAkmal (Gemini):\n{insight.strip()}" if (insight and insight.strip()) else "\n\nAnalisis BotAkmal (Gemini): -"
+    send_fonnte_message(message + block)
 
 
-# ==================== FIREWALL ====================
-def block_ip(ip):
-    if is_admin_ip(ip):
-        logging.info(f"[SKIP BLOCK] IP admin {ip}")
-        return False
-
-    try:
-        if shutil.which("ufw"):
-            subprocess.run(["ufw", "deny", "from", ip], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            logging.warning(f"[BLOCKED ufw] {ip}")
-            return True
-        elif shutil.which("iptables"):
-            subprocess.run(["iptables", "-I", "INPUT", "1", "-s", ip, "-j", "DROP"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            logging.warning(f"[BLOCKED iptables] {ip}")
-            return True
-        else:
-            logging.warning("[BLOCK] Tidak ada ufw/iptables ditemukan - tidak bisa memblokir secara otomatis.")
-            return False
-    except Exception as e:
-        logging.warning(f"[BLOCK ERROR] {e}")
-        return False
-
-
-# ==================== DETECTION ENGINE ====================
-def detect_patterns(req):
-    found = []
-    for p in SQLI_PATTERNS:
-        if re.search(p, req):
-            found.append("SQLi")
-            break
-    for p in XSS_PATTERNS:
-        if re.search(p, req):
-            found.append("XSS")
-            break
-    return found
-
-
-def parse_event(line):
-    """
-    Mengembalikan dict event jika terdeteksi jenis event yang dikenali.
-    Memperbaiki grup regex untuk login success/fail.
-    """
-    now = utc_now()
-    if m := RE_FAIL.search(line):
-        # groups: user, ip
-        return {"type": "login_fail", "ip": m.group(2), "user": m.group(1), "ts": now}
-    if m := RE_SUCCESS.search(line):
-        # groups: user, ip
-        return {"type": "login_success", "ip": m.group(2), "user": m.group(1), "ts": now}
-    if m := RE_WEB_ACCESS.search(line):
-        return {"type": "web_access", "ip": m.group("ip"), "req": m.group("req"), "status": int(m.group("status")), "ts": now}
+def parse_event(line: str):
+    now = utc_now_iso()
+    m = RE_SUCCESS.search(line)
+    if m:
+        return {"ts": now, "type": "login_success", "user": m.group("user"), "ip": m.group("ip"),
+                "method": m.group("method"), "raw": line.strip()}
+    m = RE_FAIL.search(line)
+    if m:
+        return {"ts": now, "type": "login_fail", "user": m.group("user"), "ip": m.group("ip"), "raw": line.strip()}
+    m = RE_SESSION_OPEN.search(line)
+    if m and ALERT_SESSION_OPEN:
+        return {"ts": now, "type": "session_open", "user": m.group("user"), "raw": line.strip()}
     return None
 
 
-# ==================== MAIN LOOP ====================
-def main():
-    logging.info(f"[BotAkmal] Memantau log di {HOSTNAME}...")
-    ip_fail = defaultdict(deque)
+def tail_file(path: str):
+    pos = None
+    initialized = False
+    while True:
+        try:
+            with open(path, "r", errors="ignore") as f:
+                if not initialized:
+                    f.seek(0, os.SEEK_END)
+                    pos = f.tell()
+                    initialized = True
+                else:
+                    f.seek(pos)
+                chunk = f.read()
+                if chunk:
+                    pos = f.tell()
+                    for line in chunk.splitlines():
+                        yield line
+                else:
+                    size = os.path.getsize(path)
+                    if size < pos:
+                        pos = 0
+        except FileNotFoundError:
+            pass
+        time.sleep(POLL_INTERVAL)
+        yield None
 
-    # Tentukan paths yang ada
-    paths = [p for p in LOG_PATHS + WEB_LOG_PATHS if os.path.exists(p)]
-    if not paths:
-        logging.warning("Tidak ada log ditemukan. Pastikan LOG_PATHS sesuai dan file dapat diakses.")
-        return
 
-    # Open files and seek to end (tail -f behavior)
-    files = {}
+def iter_journald_sshd() -> Iterator[str | None]:
     try:
-        for p in paths:
-            try:
-                files[p] = open(p, "r", errors="ignore")
-                files[p].seek(0, os.SEEK_END)
-            except Exception as e:
-                logging.warning("Tidak bisa membuka %s: %s", p, e)
-    except Exception as e:
-        logging.error("Gagal membuka log files: %s", e)
-        return
+        proc = subprocess.Popen(
+            [
+                "journalctl",
+                "-f",
+                "-n", "0",
+                "-o", "cat",
+                "-u", "ssh",
+                "-u", "sshd",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except Exception:
+        proc = None
 
-    try:
-        while True:
-            for p, f in list(files.items()):
-                line = f.readline()
-                if not line:
-                    # tidak ada baris baru, lanjut
-                    time.sleep(0.2)
-                    continue
-
-                evt = parse_event(line)
-                if not evt:
-                    continue
-
-                ip = evt.get("ip")
-                if not ip:
-                    continue
-
-                # IGNORE admin IP entirely
-                if is_admin_ip(ip):
-                    logging.debug("Skip event from admin IP %s", ip)
-                    continue
-
-                # --- SSH Brute-force detection ---
-                if evt["type"] == "login_fail":
-                    dq = ip_fail[ip]
-                    dq.append(time.time())
-                    # remove timestamps outside window
-                    while dq and dq[0] < time.time() - FAIL_WINDOW_SEC:
-                        dq.popleft()
-
-                    logging.debug("Fail count %s => %d", ip, len(dq))
-
-                    if len(dq) >= FAIL_THRESHOLD:
-                        # Attempt to block
-                        blocked = block_ip(ip)
-                        summary = f"{len(dq)} kali gagal login SSH dari {ip}"
-                        # Always request analysis (but limit timeout)
-                        analysis = gemini_insight(summary)
-                        msg = format_whatsapp_message(summary, ["BruteForce"], analysis)
-                        send_fonnte_message(ip, msg)
-                        # reset counter after action (regardless blocked or not)
-                        dq.clear()
-
-                # --- Web attacks / suspicious accesses ---
-                elif evt["type"] == "web_access":
-                    req = evt.get("req", "")
-                    status = evt.get("status", 0)
-                    patterns = detect_patterns(req)
-
-                    # If only HTTP error but no pattern, label as HTTP error so DETEKSI isn't '-'
-                    if not patterns and status >= 400:
-                        patterns = [f"HTTP {status} Error"]
-
-                    if patterns or status >= 400:
-                        summary = f"Permintaan mencurigakan dari {ip}: {req} (status {status})"
-                        analysis = gemini_insight(summary)
-                        msg = format_whatsapp_message(summary, patterns, analysis)
-                        send_fonnte_message(ip, msg)
-
+    buffer = ""
+    last_yield = time.time()
+    while True:
+        if proc and proc.stdout:
+            line = proc.stdout.readline()
+            if line:
+                yield line.rstrip("\n")
+                last_yield = time.time()
+            else:
+                if time.time() - last_yield >= POLL_INTERVAL:
+                    last_yield = time.time()
+                    yield None
+                time.sleep(0.1)
+        else:
             time.sleep(POLL_INTERVAL)
-    except KeyboardInterrupt:
-        logging.info("[BotAkmal] Dihentikan oleh pengguna.")
-    except Exception as e:
-        logging.exception("[BotAkmal] Error utama: %s", e)
-    finally:
-        for f in files.values():
+            yield None
+
+
+def format_whatsapp_message_v2(event: dict, analysis_text: str | None = None) -> str:
+    lines = [
+        f"[Login Monitor] Host: {HOSTNAME}",
+        f"Time: {event.get('ts', '-')}",
+        f"Type: {event.get('type', '-')}",
+        f"User: {event.get('user', '-')}",
+    ]
+    if 'ip' in event:
+        lines.append(f"IP: {event.get('ip')}")
+    if 'method' in event:
+        lines.append(f"Method: {event.get('method')}")
+
+    lines.append("")
+    lines.append("Analisis:")
+    if analysis_text and analysis_text.strip():
+        lines.append(analysis_text.strip())
+    else:
+        lines.append("*Tingkat Risiko:* -\n\n*Alasan:* -")
+
+    return "\n".join(lines)
+
+
+def main():
+    logging.info("Mulai monitor log SSH...")
+    ip_fail: dict[str, deque[float]] = defaultdict(deque)
+    blocked_ips: set[str] = set()
+    last_sent: dict[tuple, float] = {}
+    DEDUP_TTL_SEC = 60.0
+
+    existing_paths = [p for p in LOG_PATHS if os.path.exists(p)]
+    tails = []
+    if existing_paths:
+        tails.extend([(p, tail_file(p)) for p in existing_paths])
+        for p in existing_paths:
+            logging.info("Membaca log file: %s", p)
+    else:
+        logging.warning("Tidak menemukan file log di %s; memakai journald ssh/sshd",
+                        ", ".join(LOG_PATHS))
+        tails.append(("journald:ssh", iter_journald_sshd()))
+        logging.info("Membaca log via journald unit ssh/sshd")
+
+    while True:
+        for path, gen in tails:
             try:
-                f.close()
+                line = next(gen)
             except Exception:
-                pass
+                continue
+            if line is None:
+                continue
+
+            evt = parse_event(line)
+            if not evt:
+                continue
+
+            now_ts = time.time()
+            cutoff_fail = now_ts - FAIL_WINDOW_SEC
+
+            if evt["type"] == "login_fail":
+                dq = ip_fail[evt["ip"]]
+                dq.append(now_ts)
+                while dq and dq[0] < cutoff_fail:
+                    dq.popleft()
+
+                key_fail = ("login_fail_single", evt.get("user"), evt.get("ip"))
+                if last_sent.get(key_fail, 0) + DEDUP_TTL_SEC <= now_ts:
+                    summ_single = f"login_fail user={evt.get('user')} ip={evt.get('ip','-')} host={HOSTNAME}"
+                    analysis_single = gemini_insight_with_timeout(summ_single)
+                    msg_single = format_whatsapp_message_v2(evt, analysis_single)
+                    send_fonnte_message(msg_single)
+                    last_sent[key_fail] = now_ts
+
+                if len(dq) >= FAIL_THRESHOLD and evt["ip"] not in blocked_ips:
+                    summ = f"{len(dq)} kali gagal login dari {evt['ip']} dalam {FAIL_WINDOW_SEC}s"
+                    analysis = gemini_insight_with_timeout(summ)
+                    msg = format_whatsapp_message_v2(evt, analysis)
+                    send_fonnte_message(msg)
+                    blocked_ips.add(evt["ip"])
+                    logging.warning("Blokir IP %s", evt["ip"])
+
+            if evt["type"] == "login_success":
+                key = (evt["type"], evt.get("user"), evt.get("ip"))
+                if last_sent.get(key, 0) + DEDUP_TTL_SEC <= now_ts:
+                    summ = f"{evt['type']} user={evt.get('user')} ip={evt.get('ip','-')} host={HOSTNAME}"
+                    analysis = gemini_insight_with_timeout(summ)
+                    msg = format_whatsapp_message_v2(evt, analysis)
+                    send_fonnte_message(msg)
+                    last_sent[key] = now_ts
+
+            if ALERT_SESSION_OPEN and evt["type"] == "session_open":
+                key = (evt["type"], evt.get("user"))
+                if last_sent.get(key, 0) + DEDUP_TTL_SEC <= now_ts:
+                    summ = f"{evt['type']} user={evt.get('user')} host={HOSTNAME}"
+                    analysis = gemini_insight_with_timeout(summ)
+                    msg = format_whatsapp_message_v2(evt, analysis)
+                    send_fonnte_message(msg)
+                    last_sent[key] = now_ts
 
 
-# ==================== STARTUP ====================
 if __name__ == "__main__":
-    logging.info("[BotAkmal] Starting monitor...")
-    def _startup():
-        msg = f"🟢 [BotAkmal] Aktif di {HOSTNAME}\nPemantauan log dimulai."
-        # use 'system' key for startup cooldown tracking
-        send_fonnte_message("system", msg.strip())
+    logging.info("[BotAkmal] monitor start di %s", HOSTNAME)
 
-    threading.Thread(target=_startup, daemon=True).start()
+    def _notify_startup():
+        try:
+            sources = [p for p in LOG_PATHS if os.path.exists(p)]
+            source_msg = f"files={', '.join(sources)}" if sources else "journald:ssh,sshd"
+            send_with_gemini(
+                f"[BotAkmal] monitor start di {HOSTNAME}. Sumber log: {source_msg}",
+                summary=f"monitor startup host={HOSTNAME} sources={source_msg}"
+            )
+        except Exception as e:
+            logging.warning("Startup notify gagal: %s", e)
+
+    threading.Thread(target=_notify_startup, daemon=True).start()
     main()
