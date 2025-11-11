@@ -13,7 +13,7 @@ pipeline {
         SCRIPT_FILE = "monitorAkmal.py"
         FONNTE_TOKEN = "R3JmjUG5sAmGbSEE7gcG"
         FONNTE_TARGETS = "6281933976553"
-        GEMINI_API_KEY = "AIzaSyCleGyLzyLB4Ni08RiqJo3bq6E789pGWM4"
+        GEMINI_API_KEY = "AIzaSyBEs_tXMSn30of1PvGnwn5mwrvogzOk_fo"
         GEMINI_MODEL = "gemini-2.5-flash"
     }
 
