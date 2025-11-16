@@ -1,0 +1,14 @@
+1.	Buat repo
+2.	Buatfile monitoring di vsc atau di yang lain
+3.	Hubungkan dengan remote
+4.	Buat job (pipeline)
+a.	New item
+b.	Enter name, misal : testmonitor
+c.	Sellect item type
+d.	Ok
+i.	Di dalam pipeline pilih Pipeline script from SCM 
+ii.	SCM : git
+iii.	Repository URL : https://github.com/Aakmall/TestServerMonitor1.git
+iv.	Credential tidak perlu karena repo public
+v.	Branch to build : main
+vi.	Script path : Jenkinsfile
